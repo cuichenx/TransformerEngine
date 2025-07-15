@@ -131,14 +131,15 @@ def cross_entropy_kernel(
     Y_ptr += program_id * Y_stride
     y = tl.load(Y_ptr)
 
-    if y == ignore_idx:
+    loss_ptr += program_id * loss_stride
+    
+    # Handle ignore_idx case - set gradients to 0 but continue with distributed communication
+    is_ignored = y == ignore_idx
+    if is_ignored:
         # set all X_ptr as 0
         for i in range(0, n_cols, BLOCK_SIZE):
             X_offsets = i + tl.arange(0, BLOCK_SIZE)
             tl.store(X_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
-        return
-
-    loss_ptr += program_id * loss_stride
     m_d_X_y_ptr += program_id * 3 * m_d_X_y_stride
 
     # Need to reduce the m/d/X_y values from other TP ranks
@@ -156,6 +157,11 @@ def cross_entropy_kernel(
         d = d * tl.exp(m - tl.maximum(m, m_new)) + d_new * tl.exp(m_new - tl.maximum(m, m_new))
         m = tl.maximum(m, m_new)
         ori_X_y = tl.maximum(ori_X_y, X_y_new)
+
+    # Skip gradient computation for ignored tokens but still participate in distributed communication
+    if is_ignored:
+        tl.store(loss_ptr, 0.0)
+        return
 
     # Label smoothing is a general case of normal cross entropy
     scaled_x_sum = 0.0
@@ -292,6 +298,7 @@ def cross_entropy_forward(
 
     rank = 0 if dist_process_group is None else dist.get_rank(dist_process_group)
 
+    print(f"Rank {rank}: Launching online_softmax_kernel")
     online_softmax_kernel[(n_rows,)](
         X_ptr=_input,
         X_stride=_input.stride(-2),
@@ -304,17 +311,25 @@ def cross_entropy_forward(
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=32,
     )
+    print(f"Rank {rank}: Completed online_softmax_kernel")
 
     world_size = 1 if dist_process_group is None else dist.get_world_size(dist_process_group)
 
     if world_size > 1:
+        print(f"Rank {rank}: Starting all_gather, world_size={world_size}")
+        # Force synchronization before communication
+        dist.barrier(group=dist_process_group)
         m_d_X_y_gathered = torch.zeros(
             n_rows * 3 * world_size, dtype=torch.float32, device=_input.device
         )
         dist.all_gather_into_tensor(m_d_X_y_gathered, m_d_X_y, group=dist_process_group)
+        # Force synchronization after communication
+        dist.barrier(group=dist_process_group)
+        print(f"Rank {rank}: Completed all_gather")
     else:
         m_d_X_y_gathered = m_d_X_y
 
+    print(f"Rank {rank}: Launching cross_entropy_kernel")
     cross_entropy_kernel[(n_rows,)](
         X_ptr=_input,
         X_stride=_input.stride(-2),
@@ -334,6 +349,7 @@ def cross_entropy_forward(
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=32,
     )
+    print(f"Rank {rank}: Completed cross_entropy_kernel")
 
     loss = torch.reshape(loss_1d, (B, SQ)) if not reduce_loss else (torch.sum(loss_1d) / n_rows)
 
