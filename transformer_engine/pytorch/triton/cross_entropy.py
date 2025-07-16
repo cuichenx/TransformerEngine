@@ -314,7 +314,7 @@ def cross_entropy_forward(
         dist.all_gather_into_tensor(m_d_X_y_gathered, m_d_X_y, group=dist_process_group)
     else:
         m_d_X_y_gathered = m_d_X_y
-
+    print(f"Rank {rank}: Launching cross_entropy_kernel")
     cross_entropy_kernel[(n_rows,)](
         X_ptr=_input,
         X_stride=_input.stride(-2),
@@ -335,7 +335,7 @@ def cross_entropy_forward(
         num_warps=32,
     )
 
-    loss = torch.reshape(loss_1d, (B, SQ)) if not reduce_loss else (torch.sum(loss_1d) / n_rows)
+    loss = torch.reshape(loss_1d, (B, SQ)) #if not reduce_loss else (torch.sum(loss_1d) / n_rows)
 
     return loss, _input
 
